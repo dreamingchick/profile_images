@@ -39,7 +39,7 @@ async function rateLimit(req,env,scope,maxPerWindow,seconds) {
   return Number(row?.count||999)>maxPerWindow;
 }
 async function turnstile(form,req,env) {
-  if(!env.TURNSTILE_SECRET) return true; // For production, configure both Turnstile secrets.
+  if(!env.TURNSTILE_SECRET) return !env.TURNSTILE_SITE_KEY; // Fail closed when production site key is present but secret has not been provisioned.
   const token=String(form.get('cf-turnstile-response')||form.get('turnstile_token')||'');
   if(!token)return false;
   const body=new FormData();body.append('secret',env.TURNSTILE_SECRET);body.append('response',token);
