@@ -83,7 +83,7 @@ npm run db:remote
 npm run deploy
 ```
 
-출력된 `https://profile-images.<계정명>.workers.dev` 주소에서 작동을 확인합니다. GitHub에 코드를 올리는 것만으로 Cloudflare 서비스가 자동 배포되지는 않습니다. 배포 자동화를 원하면 Workers의 Git 연동을 별도로 설정하세요.
+출력된 `https://profile-images.<계정명>.workers.dev` 주소에서 작동을 확인합니다. GitHub Actions 자동 배포 워크플로우가 준비되어 있습니다. 아래 설정을 마치고 `CLOUDFLARE_DEPLOY_ENABLED` 변수를 `true`로 바꾸면 `main` 브랜치 변경 시 자동 배포합니다. 최초 설정 전에는 자동 배포가 실행되지 않습니다.
 
 **배포 전 점검:**
 - 정식 도메인을 사용할 경우 Turnstile에 해당 호스트 이름을 등록했는지 확인
@@ -92,7 +92,29 @@ npm run deploy
 - 의뢰·비공개 파일에 무단 접근할 수 없는지 점검
 - R2 월 요청·저장량, Workers/D1 사용량과 Cloudflare 과금 설정 확인
 
-## 5. 파일 저장 / 무료 한도 보호
+## 5. GitHub Actions로 자동 배포 (권장)
+
+`.github/workflows/cloudflare-deploy.yml`은 `main` 브랜치의 변경을 테스트한 뒤, 명시적으로 배포가 활성화된 경우에만 D1 마이그레이션과 Workers 배포를 실행합니다. 배포 결과의 `/api/config`, `/api/gallery` 응답도 점검합니다.
+
+1. Cloudflare에서 D1 `profile-images-db`, **비공개** R2 버킷 `profile-images-files`, Turnstile 위젯을 만듭니다. 버킷은 공개 주소로 전환하지 마세요.
+2. Cloudflare 계정 ID와 Workers 배포 및 D1 마이그레이션에 필요한 최소 권한으로 제한한 API 토큰을 발급합니다.
+3. GitHub 저장소 **Settings → Secrets and variables → Actions**의 *Repository secrets*에 아래 다섯 항목을 등록합니다. **절대 대화창이나 소스코드에 입력하지 마세요.**
+   - `CLOUDFLARE_API_TOKEN`: Cloudflare API 토큰
+   - `CLOUDFLARE_ACCOUNT_ID`: Cloudflare 계정 ID
+   - `ADMIN_PASSWORD`: 12자 이상 관리자 비밀번호
+   - `SESSION_SECRET`: 32자 이상 암호학적으로 생성한 임의 문자열
+   - `TURNSTILE_SECRET`: Turnstile 서버 측 비밀 키
+4. 같은 화면의 *Repository variables*에 아래 항목을 등록합니다.
+   - `CLOUDFLARE_D1_DATABASE_ID`: 생성된 D1 데이터베이스 ID(UUID)
+   - `TURNSTILE_SITE_KEY`: Turnstile 공개 사이트 키
+   - `CLOUDFLARE_DEPLOY_ENABLED`: 초기에는 `false`. 모든 값이 올바른지 검토한 뒤 `true`로 변경
+5. GitHub **Actions → Test and deploy to Cloudflare → Run workflow**를 선택해 최초 배포합니다. 이후에는 관련 파일을 `main` 브랜치에 푸시하면 테스트와 배포가 자동 실행됩니다.
+
+워크플로우는 D1 ID와 Turnstile 공개 키를 **CI 환경의 임시 Wrangler 설정 파일에만** 넣습니다. 이를 GitHub 저장소에 커밋하지 않습니다. Worker 런타임 비밀 키는 Wrangler Action에서 Cloudflare Secret으로 등록합니다.
+
+**주의:** `CLOUDFLARE_DEPLOY_ENABLED=false`이거나 변수가 없으면 테스트만 실행하고 배포를 건너뜁니다. Cloudflare 계정 연결을 위한 인증은 소유자가 승인해야 하며, R2 활성화 시 결제 수단 등록 및 초과 과금 정책을 확인하세요. 무료 한도 내에서만 사용하도록 의도했지만 외부 트래픽·과금의 절대적 차단을 보증하지는 않습니다.
+
+## 6. 파일 저장 / 무료 한도 보호
 
 - R2 저장량 **7GB 도달 전후부터 비회원 참고 이미지 업로드 차단**
 - R2 저장량 **8GB에서 모든 새 이미지 업로드 차단**
@@ -104,7 +126,7 @@ npm run deploy
 
 **반드시 이해해야 할 한계:** 앱의 `used_bytes`는 앱을 통해 저장·삭제한 파일의 합계입니다. 외부에서 버킷에 직접 업로드한 파일이나 R2 내부 과금 측정값과 차이가 날 수 있으며, R2 읽기·쓰기 요청 수와 Workers/D1 한도를 강제로 차단하지는 않습니다. 월 0원 절대 보장책이 아니므로 Cloudflare 실제 사용량/청구 내역을 별도로 점검하세요. 실패 직후 발생한 예외적 불일치도 운영자가 확인해야 합니다.
 
-## 6. 자동 검증
+## 7. 자동 검증
 
 ```bash
 npm run check
