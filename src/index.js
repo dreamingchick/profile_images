@@ -76,8 +76,9 @@ async function storeFiles(env,requestId,kind,files) {
       if(!put)throw new Error('업로드를 완료하지 못했습니다.');
       uploaded.push({id,key});
       maxPos+=1;
-      await env.DB.prepare('INSERT INTO images(id,request_id,kind,storage_key,mime,filename,size_bytes,position,is_cover,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)')
-        .bind(id,requestId,kind,key,file.type,safeName(file.name),file.size,maxPos,kind==='result'&&!haveCover&&uploaded.length===1?1:0,unix()).run();
+      const inserted = await env.DB.prepare('INSERT INTO images(id,request_id,kind,storage_key,mime,filename,size_bytes,position,is_cover,created_at) SELECT ?,?,?,?,?,?,?,?,?,? FROM active_requests WHERE id=?')
+        .bind(id,requestId,kind,key,file.type,safeName(file.name),file.size,maxPos,kind==='result'&&!haveCover&&uploaded.length===1?1:0,unix(),requestId).run();
+      if (inserted.meta?.changes !== 1) throw new Error('의뢰가 만료되었거나 삭제되었습니다.');
     }
     return uploaded;
   } catch(e) {
@@ -86,12 +87,22 @@ async function storeFiles(env,requestId,kind,files) {
   }
 }
 function publicImage(img){return {id:img.id,mime:img.mime,filename:img.filename,position:img.position,is_cover:img.is_cover,url:'/api/gallery-image/'+img.id};}
-async function serveObject(env,row,download=false,cache=false) {
+async function serveObject(env,row,download=false) {
   const obj=await env.IMAGES.get(row.storage_key);
   if(!obj)return error('파일을 찾을 수 없습니다.',404);
-  const headers=new Headers({'content-type':row.mime,'x-content-type-options':'nosniff','cache-control':cache?'public, max-age=60':'private, no-store'});
+  const headers=new Headers({'content-type':row.mime,'x-content-type-options':'nosniff','cache-control':'private, no-store'});
   if(download)headers.set('content-disposition',"attachment; filename*=UTF-8''"+encodeURIComponent(safeName(row.filename)));
   return new Response(obj.body,{headers});
+}
+
+async function deleteRequest(env, id) {
+  const {results} = await env.DB.prepare('SELECT storage_key FROM images WHERE request_id=?').bind(id).all();
+  if (results.length) await env.IMAGES.delete(results.map(image => image.storage_key));
+  // R2 deletion can be repeated. Keep the DB rows until the files are gone.
+  await env.DB.batch([
+    env.DB.prepare('UPDATE quotas SET used_bytes=MAX(0,used_bytes-(SELECT COALESCE(SUM(size_bytes),0) FROM images WHERE request_id=?)) WHERE id=1').bind(id),
+    env.DB.prepare('DELETE FROM requests WHERE id=?').bind(id)
+  ]);
 }
 
 async function api(req,env) {
@@ -125,33 +136,45 @@ async function api(req,env) {
   }
 
   const track=p.match(/^\/api\/track\/([a-f0-9]{64})$/);
+  if(track&&m==='DELETE') {
+    const tokenHash = await hash(track[1]);
+    const request = await env.DB.prepare('UPDATE requests SET deletion_pending=1 WHERE token_hash=? RETURNING id').bind(tokenHash).first();
+    if (!request) return error('의뢰를 찾을 수 없습니다.',404);
+    try {
+      await deleteRequest(env, request.id);
+      return json({ok:true});
+    } catch {
+      console.error('Request file cleanup will be retried.');
+      return json({pending:true},202);
+    }
+  }
   if(track&&m==='GET') {
-    const r=await env.DB.prepare('SELECT id,code,nickname,title,ratio,status,consent,created_at,updated_at,published FROM requests WHERE token_hash=?').bind(await hash(track[1])).first();
+    const r=await env.DB.prepare('SELECT id,code,nickname,title,ratio,status,consent,created_at,updated_at,published FROM active_requests WHERE token_hash=?').bind(await hash(track[1])).first();
     if(!r)return error('의뢰를 찾을 수 없습니다.',404);
     const {results}=await env.DB.prepare("SELECT id,filename,mime,is_cover,position FROM images WHERE request_id=? AND kind='result' ORDER BY position,id").bind(r.id).all();
-    return json({request:{code:r.code,nickname:r.nickname,title:r.title,ratio:r.ratio,status:r.status,consent:r.consent,created_at:r.created_at,published:r.published},images:results.map(img=>({...img,url:'/api/track/'+track[1]+'/image/'+img.id}))});
+    return json({request:{code:r.code,nickname:r.nickname,title:r.title,ratio:r.ratio,status:r.status,consent:r.consent,created_at:r.created_at,expires_at:r.created_at+604800,published:r.published},images:results.map(img=>({...img,url:'/api/track/'+track[1]+'/image/'+img.id}))});
   }
   const trackImg=p.match(/^\/api\/track\/([a-f0-9]{64})\/image\/([0-9a-f-]{36})$/);
   if(trackImg&&m==='GET') {
-    const row=await env.DB.prepare("SELECT i.storage_key,i.mime,i.filename FROM images i JOIN requests r ON i.request_id=r.id WHERE r.token_hash=? AND i.id=? AND i.kind='result'").bind(await hash(trackImg[1]),trackImg[2]).first();
+    const row=await env.DB.prepare("SELECT i.storage_key,i.mime,i.filename FROM images i JOIN active_requests r ON i.request_id=r.id WHERE r.token_hash=? AND i.id=? AND i.kind='result'").bind(await hash(trackImg[1]),trackImg[2]).first();
     return row?serveObject(env,row,u.searchParams.has('download')):error('파일을 찾을 수 없습니다.',404);
   }
   if(p==='/api/gallery'&&m==='GET') {
     const q=clean(u.searchParams.get('q'),100),page=Math.max(1,Math.min(1000,Number(u.searchParams.get('page'))||1));
-    const {results}=await env.DB.prepare("SELECT r.id,r.title,r.nickname,r.created_at,(SELECT i.id FROM images i WHERE i.request_id=r.id AND i.kind='result' ORDER BY is_cover DESC,position ASC LIMIT 1) AS cover_id,(SELECT COUNT(*) FROM images i WHERE i.request_id=r.id AND i.kind='result') AS image_count FROM requests r WHERE r.published=1 AND r.consent=1 AND r.status='completed' AND r.title LIKE ? ORDER BY r.updated_at DESC LIMIT 18 OFFSET ?").bind('%'+q+'%',(page-1)*18).all();
+    const {results}=await env.DB.prepare("SELECT r.id,r.title,r.nickname,r.created_at,(SELECT i.id FROM images i WHERE i.request_id=r.id AND i.kind='result' ORDER BY is_cover DESC,position ASC LIMIT 1) AS cover_id,(SELECT COUNT(*) FROM images i WHERE i.request_id=r.id AND i.kind='result') AS image_count FROM active_requests r WHERE r.published=1 AND r.consent=1 AND r.status='completed' AND r.title LIKE ? ORDER BY r.updated_at DESC LIMIT 18 OFFSET ?").bind('%'+q+'%',(page-1)*18).all();
     return json({items:results.map(r=>({...r,cover_url:r.cover_id?'/api/gallery-image/'+r.cover_id:null})),page});
   }
   const gallery=p.match(/^\/api\/gallery\/([0-9a-f-]{36})$/);
   if(gallery&&m==='GET') {
-    const r=await env.DB.prepare("SELECT id,title,nickname,created_at,updated_at FROM requests WHERE id=? AND published=1 AND consent=1 AND status='completed'").bind(gallery[1]).first();
+    const r=await env.DB.prepare("SELECT id,title,nickname,created_at,updated_at FROM active_requests WHERE id=? AND published=1 AND consent=1 AND status='completed'").bind(gallery[1]).first();
     if(!r)return error('작품을 찾을 수 없습니다.',404);
     const {results}=await env.DB.prepare("SELECT id,filename,mime,position,is_cover FROM images WHERE request_id=? AND kind='result' ORDER BY position,id").bind(r.id).all();
     return json({item:r,images:results.map(publicImage)});
   }
   const galleryImg=p.match(/^\/api\/gallery-image\/([0-9a-f-]{36})$/);
   if(galleryImg&&m==='GET') {
-    const r=await env.DB.prepare("SELECT i.storage_key,i.mime,i.filename FROM images i JOIN requests r ON i.request_id=r.id WHERE i.id=? AND i.kind='result' AND r.published=1 AND r.consent=1 AND r.status='completed'").bind(galleryImg[1]).first();
-    return r?serveObject(env,r,u.searchParams.has('download'),true):error('파일을 찾을 수 없습니다.',404);
+    const r=await env.DB.prepare("SELECT i.storage_key,i.mime,i.filename FROM images i JOIN active_requests r ON i.request_id=r.id WHERE i.id=? AND i.kind='result' AND r.published=1 AND r.consent=1 AND r.status='completed'").bind(galleryImg[1]).first();
+    return r?serveObject(env,r,u.searchParams.has('download')):error('파일을 찾을 수 없습니다.',404);
   }
 
   if(p==='/api/prompts'&&m==='GET') {
@@ -194,18 +217,18 @@ async function api(req,env) {
     if(!(await adminSession(req,env)))return error('관리자 로그인이 필요합니다.',401);
     if(p==='/api/admin/requests'&&m==='GET'){
       const status=clean(u.searchParams.get('status'),30),q=clean(u.searchParams.get('q'),100);
-      const {results}=await env.DB.prepare('SELECT id,code,title,nickname,status,consent,published,created_at,updated_at FROM requests WHERE (?="" OR status=?) AND (title LIKE ? OR code LIKE ?) ORDER BY created_at DESC LIMIT 150').bind(status,status,'%'+q+'%','%'+q+'%').all();
+      const {results}=await env.DB.prepare('SELECT id,code,title,nickname,status,consent,published,created_at,updated_at FROM active_requests WHERE (?="" OR status=?) AND (title LIKE ? OR code LIKE ?) ORDER BY created_at DESC LIMIT 150').bind(status,status,'%'+q+'%','%'+q+'%').all();
       return json({items:results});
     }
     const detail=p.match(/^\/api\/admin\/requests\/([0-9a-f-]{36})$/);
     if(detail&&m==='GET'){
-      const r=await env.DB.prepare('SELECT id,code,title,nickname,details,ratio,consent,status,published,admin_note,created_at,updated_at FROM requests WHERE id=?').bind(detail[1]).first();
+      const r=await env.DB.prepare('SELECT id,code,title,nickname,details,ratio,consent,status,published,admin_note,created_at,updated_at FROM active_requests WHERE id=?').bind(detail[1]).first();
       if(!r)return error('의뢰를 찾을 수 없습니다.',404);
       const {results}=await env.DB.prepare('SELECT id,kind,mime,filename,size_bytes,position,is_cover FROM images WHERE request_id=? ORDER BY kind,position,id').bind(r.id).all();
       return json({item:r,images:results.map(img=>({...img,url:'/api/admin/image/'+img.id}))});
     }
     if(detail&&m==='PATCH'){
-      const data=await req.json().catch(()=>({})),old=await env.DB.prepare('SELECT * FROM requests WHERE id=?').bind(detail[1]).first();
+      const data=await req.json().catch(()=>({})),old=await env.DB.prepare('SELECT * FROM active_requests WHERE id=?').bind(detail[1]).first();
       if(!old)return error('의뢰를 찾을 수 없습니다.',404);
       const status=data.status===undefined?old.status:data.status;
       if(!STATUSES.includes(status))return error('잘못된 진행 상태입니다.');
@@ -214,12 +237,12 @@ async function api(req,env) {
       if(published&&(!old.consent||status!=='completed'||count.n<1))return error('공개 동의·제작 완료·결과 이미지 등록이 모두 필요합니다.');
       const note=clean(data.admin_note===undefined?old.admin_note:data.admin_note,2000);
       if(note.length>2000)return error('관리자 메모가 너무 깁니다.');
-      await env.DB.prepare('UPDATE requests SET status=?,published=?,admin_note=?,updated_at=? WHERE id=?').bind(status,published,note,unix(),detail[1]).run();
+      await env.DB.prepare('UPDATE requests SET status=?,published=?,admin_note=?,updated_at=? WHERE id IN (SELECT id FROM active_requests WHERE id=?)').bind(status,published,note,unix(),detail[1]).run();
       return json({ok:true});
     }
     const resultUpload=p.match(/^\/api\/admin\/requests\/([0-9a-f-]{36})\/images$/);
     if(resultUpload&&m==='POST'){
-      const exists=await env.DB.prepare('SELECT id FROM requests WHERE id=?').bind(resultUpload[1]).first();if(!exists)return error('의뢰를 찾을 수 없습니다.',404);
+      const exists=await env.DB.prepare('SELECT id FROM active_requests WHERE id=?').bind(resultUpload[1]).first();if(!exists)return error('의뢰를 찾을 수 없습니다.',404);
       const form=await req.formData(),files=filesFrom(form,'images');
       const count=await env.DB.prepare("SELECT COUNT(*) AS n FROM images WHERE request_id=? AND kind='result'").bind(resultUpload[1]).first();
       if(!files.length||files.length+count.n>20||!(await Promise.all(files.map(async f=>validImage(f,RESULT_LIMIT)&&await verifyMagic(f)))).every(Boolean))return error('결과 이미지는 최대 20장, 각 20MB의 JPG·PNG·WEBP 파일만 등록할 수 있습니다.');
@@ -231,13 +254,16 @@ async function api(req,env) {
     }
     const image=p.match(/^\/api\/admin\/image\/([0-9a-f-]{36})$/);
     if(image&&m==='GET'){
-      const row=await env.DB.prepare('SELECT storage_key,mime,filename FROM images WHERE id=?').bind(image[1]).first();
+      const row=await env.DB.prepare('SELECT i.storage_key,i.mime,i.filename FROM images i JOIN active_requests r ON i.request_id=r.id WHERE i.id=?').bind(image[1]).first();
       return row?serveObject(env,row,u.searchParams.has('download')):error('파일을 찾을 수 없습니다.',404);
     }
     if(image&&m==='DELETE'){
       const row=await env.DB.prepare('SELECT * FROM images WHERE id=?').bind(image[1]).first();if(!row)return error('파일을 찾을 수 없습니다.',404);
       await env.IMAGES.delete(row.storage_key);
-      await env.DB.prepare('DELETE FROM images WHERE id=?').bind(row.id).run();await release(env,row.size_bytes);
+      await env.DB.batch([
+        env.DB.prepare('UPDATE quotas SET used_bytes=MAX(0,used_bytes-(SELECT COALESCE(SUM(size_bytes),0) FROM images WHERE id=?)) WHERE id=1').bind(row.id),
+        env.DB.prepare('DELETE FROM images WHERE id=?').bind(row.id)
+      ]);
       if(row.kind==='result'&&row.is_cover)await env.DB.prepare("UPDATE images SET is_cover=1 WHERE id=(SELECT id FROM images WHERE request_id=? AND kind='result' ORDER BY position,id LIMIT 1)").bind(row.request_id).run();
       const count=await env.DB.prepare("SELECT COUNT(*) AS n FROM images WHERE request_id=? AND kind='result'").bind(row.request_id).first();
       if(count.n===0)await env.DB.prepare('UPDATE requests SET published=0 WHERE id=?').bind(row.request_id).run();
@@ -272,7 +298,7 @@ async function api(req,env) {
     }
     if(p==='/api/admin/usage'&&m==='GET'){
       const quota=await env.DB.prepare('SELECT used_bytes,uploads_disabled FROM quotas WHERE id=1').first();
-      const counts=await env.DB.prepare("SELECT (SELECT COUNT(*) FROM requests) AS requests,(SELECT COUNT(*) FROM prompts) AS prompts,(SELECT COUNT(*) FROM images) AS images").first();
+      const counts=await env.DB.prepare("SELECT (SELECT COUNT(*) FROM active_requests) AS requests,(SELECT COUNT(*) FROM prompts) AS prompts,(SELECT COUNT(*) FROM images) AS images").first();
       return json({quota:{...quota,hard_limit:HARD_LIMIT,warning_limit:WARN_LIMIT},counts,note:'R2/D1/Workers의 실제 과금 지표는 Cloudflare 대시보드에서 확인하세요. DB 사용량은 이 앱이 관리하는 파일 기준입니다.'});
     }
     if(p==='/api/admin/usage'&&m==='PATCH'){
@@ -284,6 +310,17 @@ async function api(req,env) {
 }
 
 export default {
+  async scheduled(_event, env) {
+    const {results} = await env.DB.prepare(
+      'SELECT id FROM requests WHERE deletion_pending=1 OR created_at <= unixepoch() - 604800 ORDER BY created_at LIMIT 12'
+    ).all();
+    let failed = false;
+    for (const request of results) {
+      try { await deleteRequest(env, request.id); }
+      catch { failed = true; }
+    }
+    if (failed) throw new Error('Some expired request files could not be deleted and will be retried.');
+  },
   async fetch(req,env) {
     if(!new URL(req.url).pathname.startsWith('/api/')) return env.ASSETS.fetch(req);
     try {return await api(req,env);}catch(e){console.error('API failure:',e?.message||e);return error('서버 처리 중 오류가 발생했습니다.',500);}

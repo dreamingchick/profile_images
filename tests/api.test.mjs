@@ -7,13 +7,14 @@ import worker from '../src/index.js';
 function fixture(){
   const db = new DatabaseSync(':memory:');
   db.exec(readFileSync(new URL('../migrations/0001_init.sql', import.meta.url),'utf8'));
+  db.exec(readFileSync(new URL('../migrations/0002_request_retention.sql', import.meta.url),'utf8'));
   const store = new Map();
   const env={
     DB:{
       prepare(sql){const st=db.prepare(sql);let args=[];return {bind(...values){args=values;return this},async first(){return st.get(...args)||null},async all(){return {results:st.all(...args)}},async run(){return {meta:st.run(...args)}}};},
       async batch(statements){return Promise.all(statements.map(s=>s.run()));}
     },
-    IMAGES:{async put(key,file){store.set(key,file);return {key}},async get(key){const f=store.get(key);return f?{body:f.stream()}:null},async delete(key){store.delete(key);}},
+    IMAGES:{async put(key,file){store.set(key,file);return {key}},async get(key){const f=store.get(key);return f?{body:f.stream()}:null},async delete(keys){for(const key of [keys].flat())store.delete(key);}},
     ASSETS:{fetch(){return new Response('SPA')}},
     ADMIN_PASSWORD:'this-is-a-long-admin-password',SESSION_SECRET:'long-test-session-secret-not-for-production', TURNSTILE_SITE_KEY:''
   };
@@ -89,4 +90,26 @@ test('storage hard-cap rejects file upload but still permits text requests',asyn
   files.append('references',png());
   assert.equal((await call('/api/requests','POST',files)).status,507);
   assert.equal((await call('/api/requests','POST',fd({nickname:'텍스트 의뢰',title:'텍스트',details:'참고 파일 없음',terms:'yes'}))).status,201);
+});
+test('request owners delete files and expired requests are inaccessible and cleaned up', async () => {
+  const {env,db,store,call}=fixture();
+  async function submit() {
+    const response=await call('/api/requests','POST',fd({nickname:'tester',title:'retention',details:'test image',terms:'yes',references:png()}));
+    assert.equal(response.status,201);
+    return (await response.json()).token;
+  }
+  const token=await submit();
+  assert.equal((await call('/api/track/'+'a'.repeat(64),'DELETE')).status,404);
+  assert.equal(store.size,1);
+  assert.equal((await call('/api/track/'+token,'DELETE')).status,200);
+  assert.equal((await call('/api/track/'+token)).status,404);
+  assert.equal(store.size,0);
+  assert.equal(db.prepare('SELECT used_bytes FROM quotas').get().used_bytes,0);
+  const expired=await submit();
+  db.exec('UPDATE requests SET created_at=unixepoch()-604800');
+  assert.equal((await call('/api/track/'+expired)).status,404);
+  await worker.scheduled({},env);
+  assert.equal(store.size,0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM requests').get().n,0);
+  assert.equal(db.prepare('SELECT used_bytes FROM quotas').get().used_bytes,0);
 });

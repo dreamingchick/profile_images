@@ -7,7 +7,9 @@
     "directory": "./public",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*"]
+    "run_worker_first": [
+      "/api/*"
+    ]
   },
   "d1_databases": [
     {
@@ -25,5 +27,10 @@
   ],
   "vars": {
     "TURNSTILE_SITE_KEY": ""
+  },
+  "triggers": {
+    "crons": [
+      "*/15 * * * *"
+    ]
   }
 }
