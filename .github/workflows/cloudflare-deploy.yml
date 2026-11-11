@@ -108,5 +108,10 @@ jobs:
             echo "No deployment URL reported; check Cloudflare dashboard."
             exit 1
           fi
-          curl --fail --silent --show-error --retry 2 "$DEPLOYMENT_URL/api/config" > /dev/null
-          curl --fail --silent --show-error --retry 2 "$DEPLOYMENT_URL/api/gallery" > /dev/null
+          for path in / /request /api/config /api/gallery; do
+            code=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' "$DEPLOYMENT_URL$path")
+            if [ "$code" != 410 ]; then
+              echo "Expected HTTP 410 for $path, received $code"
+              exit 1
+            fi
+          done

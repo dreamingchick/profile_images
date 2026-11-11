@@ -322,6 +322,12 @@ export default {
     if (failed) throw new Error('Some expired request files could not be deleted and will be retried.');
   },
   async fetch(req,env) {
+    if (env.SITE_CLOSED === 'true') {
+      return new Response('프로필 이미지 서비스가 종료되었습니다.', {
+        status: 410,
+        headers: {'content-type':'text/plain; charset=utf-8','cache-control':'no-store'}
+      });
+    }
     if(!new URL(req.url).pathname.startsWith('/api/')) return env.ASSETS.fetch(req);
     try {return await api(req,env);}catch(e){console.error('API failure:',e?.message||e);return error('서버 처리 중 오류가 발생했습니다.',500);}
   }
